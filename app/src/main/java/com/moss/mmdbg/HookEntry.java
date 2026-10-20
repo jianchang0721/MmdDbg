@@ -62,18 +62,23 @@ public class HookEntry implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     final Activity a = (Activity) param.thisObject;
-                    try {
-                        FloatPanel.Theme t = new FloatPanel.Theme();
-                        t.title = "MmdDbg";
-                        t.accent = 0xFFFF8A65;
-                        t.accentDim = 0x66FF8A65;
-                        t.textMain = 0xFFFFD54F;
-                        t.textSub = 0xFF7FD4FF;
-                        t.btnText = 0xFFFFD54F;
-                        final FloatPanel panel = FloatPanel.get(a, t);
-                        panels.put(a, panel);
+                    if (a == null) return;
+                    try { if (a.getWindow() == null) return; } catch (Throwable ignored) { return; }
 
-                        if (loadSeq == 0) lastStatus = doLoadAll();
+                    if (loadSeq == 0 && isMainProcess()) {
+                        lastStatus = doLoadAll();
+                    }
+
+                    try {
+                        FloatPanel.Theme th = new FloatPanel.Theme();
+                        th.title = "MmdDbg";
+                        th.accent = 0xFFFF8A65;
+                        th.accentDim = 0x66FF8A65;
+                        th.textMain = 0xFFFFD54F;
+                        th.textSub = 0xFF7FD4FF;
+                        th.btnText = 0xFFFFD54F;
+                        final FloatPanel panel = FloatPanel.get(a, th);
+                        panels.put(a, panel);
                         panel.setLog(lastStatus);
 
                         if (panels.size() <= 1) {
@@ -117,6 +122,18 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     // ---------------- so 加载 ----------------
+
+    static boolean isMainProcess() {
+        try {
+            java.io.BufferedReader r = new java.io.BufferedReader(
+                    new java.io.FileReader("/proc/self/cmdline"));
+            String s = r.readLine();
+            r.close();
+            return s != null && !s.contains(":");
+        } catch (Throwable t) {
+            return true;
+        }
+    }
 
     // 扫描 <dir>/libmmdbg_<模块名>.so，一个个复制成带序号的新名字再 load。
     // 改名是为了绕开 dlopen 的路径缓存，这样同一个模块也能重载。
