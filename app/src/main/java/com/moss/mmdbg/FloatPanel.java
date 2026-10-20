@@ -317,6 +317,10 @@ public class FloatPanel {
     }
 
     private int dp(int v) {
-        return (int) (v * mActivity.getResources().getDisplayMetrics().density + 0.5f);
+        try {
+            return (int) (v * mActivity.getResources().getDisplayMetrics().density + 0.5f);
+        } catch (Throwable t) {
+            return (int) (v * 1.5f);
+        }
     }
 }

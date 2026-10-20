@@ -69,6 +69,13 @@ public class HookEntry implements IXposedHookLoadPackage {
                         lastStatus = doLoadAll();
                     }
 
+                    final Activity af = a;
+                    new Handler(Looper.getMainLooper()).post(new Runnable() {
+                        @Override public void run() { installPanel(af); }
+                    });
+                }
+
+                void installPanel(final Activity a) {
                     try {
                         FloatPanel.Theme th = new FloatPanel.Theme();
                         th.title = "MmdDbg";
@@ -112,7 +119,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                             });
                         }
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + ": overlay fail " + t);
+                        XposedBridge.log(TAG + ": overlay fail " + android.util.Log.getStackTraceString(t));
                     }
                 }
             });
