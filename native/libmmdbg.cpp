@@ -69,12 +69,40 @@ static void flog(const char* fmt, ...) {
 // ============================= il2cpp 绑定 =============================
 static bool g_bound = false;
 
+// dlopen("libil2cpp.so") 在游戏进程里找不到 —— Android 的 linker namespace
+// 不会按短名解析从 APK lib 目录加载的 so。得从 /proc/self/maps 把真实路径捞出来。
+static std::string find_lib_path(const char* needle) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return "";
+    char line[1024];
+    std::string found;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, needle)) continue;
+        char* p = strchr(line, '/');
+        if (!p) continue;
+        found = p;
+        while (!found.empty() && (found.back() == '\n' || found.back() == '\r' ||
+                                  found.back() == ' ')) found.pop_back();
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
 static bool bind_api() {
-    void* h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+    std::string path = find_lib_path("libil2cpp.so");
+    void* h = nullptr;
     int how = 0;
-    if (!h) { h = dlopen("libil2cpp.so", RTLD_NOW); how = 1; }
-    if (!h) { LOGE("[IL2CPP] dlopen libil2cpp.so failed: %s", dlerror()); return false; }
-    LOGI("[IL2CPP] libil2cpp.so handle=%p (noload=%d)", h, 1 - how);
+    if (!path.empty()) {
+        h = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+        if (!h) { h = dlopen(path.c_str(), RTLD_NOW); how = 2; }
+        LOGI("[IL2CPP] path=%s handle=%p mode=%d", path.c_str(), h, how);
+    } else {
+        h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+        if (!h) { h = dlopen("libil2cpp.so", RTLD_NOW); how = 1; }
+        LOGI("[IL2CPP] shortname handle=%p mode=%d", h, how);
+    }
+    if (!h) { LOGE("[IL2CPP] dlopen libil2cpp failed: %s", dlerror()); return false; }
 
     #define B(field, sym) g_api.field = (fn_##field)dlsym(h, sym); \
         if (!g_api.field) LOGE("[IL2CPP] MISSING %s", sym)
@@ -257,6 +285,8 @@ static void probe_step() {
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_mmdbg_HookEntry_nativeTick(JNIEnv*, jclass) {
     if (!g_bound) {
+        static int tries = 0;
+        if ((tries++ % 60) != 0) return;      // 别每帧刷屏
         if (!bind_api()) return;
         LOGI("[SKIN] api bound, waiting for scene...");
     }
