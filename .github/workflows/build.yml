@@ -55,5 +55,6 @@ jobs:
             ${{ github.event.head_commit.message }}
           files: |
             app/build/outputs/apk/release/app-release.apk
-            native/build/libmmdbg.so
+            native/build/libmmdbg_model.so
+            native/build/libmmdbg_log.so
           fail_on_unmatched_files: false

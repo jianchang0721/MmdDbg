@@ -43,7 +43,8 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     static final String TAG = "MmdDbg";
     static final String PKG = "com.hermes.h1game";
-    static final String SO_NAME = "libmmdbg_latest.so";
+    static final String SO_PREFIX = "libmmdbg_";   // 扫描这个前缀的 .so，丢掉 __NAME__ 里都不需要改 APK
+    static final String SO_NAME = "libmmdbg_latest.so";   // 旧的单文件模式，兼容保留
     static final String[] DIRS = {
             "/data/data/com.hermes.h1game/files/",
             "/data/user/0/com.hermes.h1game/files/",
@@ -73,7 +74,7 @@ public class HookEntry implements IXposedHookLoadPackage {
                         installOverlay(a);
                         // 第一个 Activity 出现时自动加载一次
                         if (loadSeq == 0) {
-                            lastStatus = doLoad();
+                            lastStatus = doLoadAll();
                             refreshStatus();
                         }
                     } catch (Throwable t) {
@@ -88,30 +89,63 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     // ---------------- so 加载 ----------------
 
-    static synchronized String doLoad() {
-        File src = null;
+    // 扫描 <dir>/libmmdbg_<模块名>.so，一个个复制成带序号的新名字再 load。
+    // 改名是为了绕开 dlopen 的路径缓存，这样同一个模块也能重载。
+    static synchronized String doLoadAll() {
         String dir = null;
         for (String d : DIRS) {
-            File f = new File(d, SO_NAME);
-            if (f.exists() && f.canRead()) { src = f; dir = d; break; }
+            File dd = new File(d);
+            if (dd.isDirectory() && dd.canRead()) { dir = d; break; }
         }
-        if (src == null) {
-            return "找不到 " + SO_NAME + "（应放在 " + DIRS[0] + "）";
+        if (dir == null) return "目录不可读: " + DIRS[0];
+
+        File d = new File(dir);
+        File[] all = d.listFiles();
+        if (all == null) return "列目录失败";
+
+        java.util.ArrayList<File> mods = new java.util.ArrayList<>();
+        for (File f : all) {
+            String n = f.getName();
+            if (!f.isFile()) continue;
+            if (!n.startsWith(SO_PREFIX) || !n.endsWith(".so")) continue;
+            // 只认 libmmdbg_<纯字母>.so，跳过我们自己生成的 libmmdbg_x_1.so
+            String mid = n.substring(SO_PREFIX.length(), n.length() - 3);
+            if (mid.isEmpty()) continue;
+            boolean plain = true;
+            for (int i = 0; i < mid.length(); i++) {
+                char c = mid.charAt(i);
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) { plain = false; break; }
+            }
+            if (!plain) continue;
+            mods.add(f);
         }
-        String dstName = "libmmdbg_" + (++loadSeq) + ".so";
-        File dst = new File(dir, dstName);
-        try {
-            copy(src, dst);
-        } catch (Throwable t) {
-            return "复制失败: " + t;
+        // 兼容旧的单文件
+        File legacy = new File(dir, SO_NAME);
+        if (mods.isEmpty() && legacy.exists()) mods.add(legacy);
+        if (mods.isEmpty()) return "目录里没有 " + SO_PREFIX + "*.so";
+
+        java.util.Collections.sort(mods, new java.util.Comparator<File>() {
+            @Override public int compare(File a, File b) { return a.getName().compareTo(b.getName()); }
+        });
+
+        int seq = ++loadSeq;
+        StringBuilder sb = new StringBuilder();
+        int ok = 0;
+        for (File f : mods) {
+            String base = f.getName().substring(0, f.getName().length() - 3);
+            String dstName = base + "_" + seq + ".so";
+            File dst = new File(dir, dstName);
+            try {
+                copy(f, dst);
+                System.load(dst.getAbsolutePath());
+                ok++;
+                sb.append("OK ").append(base).append("\n");
+            } catch (Throwable t) {
+                sb.append("FAIL ").append(base).append(": ").append(t).append("\n");
+            }
         }
-        try {
-            System.load(dst.getAbsolutePath());
-            startTick();
-            return "已加载 " + dstName + "  " + dst.length() + " 字节";
-        } catch (Throwable t) {
-            return "dlopen 失败: " + t;
-        }
+        if (ok > 0) startTick();
+        return "第 " + seq + " 轮 " + ok + "/" + mods.size() + " 个模块\n" + sb;
     }
 
     // 每帧调一次 nativeTick()。so 里所有 Unity 操作都在这个回调里做，
@@ -179,7 +213,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         TextView reload = mkBtn(a, "重载 so");
         reload.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
-                lastStatus = doLoad();
+                lastStatus = doLoadAll();
                 refreshStatus();
             }
         });
@@ -189,9 +223,17 @@ public class HookEntry implements IXposedHookLoadPackage {
         where.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 StringBuilder sb = new StringBuilder();
-                for (String d : DIRS) {
-                    File f = new File(d, SO_NAME);
-                    sb.append(f.exists() ? "有 " : "无 ").append(f.getAbsolutePath()).append('\n');
+                File d0 = new File(DIRS[0]);
+                File[] fs = d0.listFiles();
+                if (fs == null) {
+                    sb.append("目录不可读: ").append(DIRS[0]);
+                } else {
+                    for (File f : fs) {
+                        String n = f.getName();
+                        if (n.startsWith(SO_PREFIX) && n.endsWith(".so"))
+                            sb.append(n).append("  ").append(f.length()).append('\n');
+                    }
+                    if (sb.length() == 0) sb.append("空: ").append(DIRS[0]);
                 }
                 lastStatus = sb.toString();
                 refreshStatus();
