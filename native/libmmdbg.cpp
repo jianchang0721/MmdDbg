@@ -33,13 +33,43 @@
 Il2CppApi g_api;
 
 // ============================= 日志 =============================
-static std::string g_logPath = "/data/data/com.hermes.h1game/files/mmdbg.log";
+// 优先写 /storage/emulated/0/MT2/log/（直接能在手机上看），
+// 写不进去（targetSdk 30 的分区存储）就退回游戏私有目录。
+static std::string g_logDir = "/data/data/com.hermes.h1game/files";
+static bool g_logOnSdcard = false;
 static FILE* g_fp = nullptr;
 static pthread_mutex_t g_logMtx = PTHREAD_MUTEX_INITIALIZER;
 
+static void pick_log_dir() {
+    const char* cands[] = {
+        "/storage/emulated/0/MT2/log",
+        "/sdcard/MT2/log",
+        "/data/data/com.hermes.h1game/files",
+    };
+    for (int i = 0; i < 3; i++) {
+        std::string dir = cands[i];
+        std::string probe = dir + "/.wtest";
+        FILE* f = fopen(probe.c_str(), "w");
+        if (f) {
+            fclose(f);
+            unlink(probe.c_str());
+            g_logDir = dir;
+            g_logOnSdcard = (i < 2);
+            return;
+        }
+    }
+}
+
 static FILE* logfp() {
     if (g_fp) return g_fp;
-    g_fp = fopen(g_logPath.c_str(), "a");
+    std::string p = g_logDir + "/mmdbg.log";
+    g_fp = fopen(p.c_str(), "a");
+    if (!g_fp && g_logDir != "/data/data/com.hermes.h1game/files") {
+        g_logDir = "/data/data/com.hermes.h1game/files";
+        g_logOnSdcard = false;
+        p = g_logDir + "/mmdbg.log";
+        g_fp = fopen(p.c_str(), "a");
+    }
     return g_fp;
 }
 
@@ -281,6 +311,47 @@ static void probe_step() {
     }
 }
 
+// ============================= logcat 捕获 =============================
+// 普通应用没有 READ_LOGS，这里的 popen 大概率读不到东西。
+// 真抓到就写文件；抓不到就把原因记一笔，免得以后又猜。
+static void* logcat_thread(void*) {
+    std::string path = g_logDir + "/logcat.log";
+    FILE* p = popen("logcat -v time 2>&1", "r");
+    if (!p) {
+        LOGI("[LOGCAT] popen failed, will rely on the root-side capture");
+        return nullptr;
+    }
+    FILE* out = fopen(path.c_str(), "w");
+    if (!out) {
+        LOGI("[LOGCAT] cannot open %s", path.c_str());
+        pclose(p);
+        return nullptr;
+    }
+    LOGI("[LOGCAT] capturing -> %s", path.c_str());
+    char buf[4096];
+    long bytes = 0;
+    int lines = 0;
+    int denied = 0;
+    while (fgets(buf, sizeof(buf), p)) {
+        if (strstr(buf, "Permission denied") || strstr(buf, "not allowed")) denied++;
+        fputs(buf, out);
+        bytes += (long)strlen(buf);
+        if (++lines % 50 == 0) fflush(out);
+        if (bytes > 8L * 1024 * 1024) {
+            fclose(out);
+            std::string old = path + ".1";
+            rename(path.c_str(), old.c_str());
+            out = fopen(path.c_str(), "w");
+            bytes = 0;
+            if (!out) break;
+        }
+    }
+    if (out) fclose(out);
+    pclose(p);
+    LOGI("[LOGCAT] thread exit, deniedLines=%d", denied);
+    return nullptr;
+}
+
 // ============================= tick 入口 =============================
 extern "C" JNIEXPORT void JNICALL
 Java_com_moss_mmdbg_HookEntry_nativeTick(JNIEnv*, jclass) {
@@ -300,12 +371,17 @@ Java_com_moss_mmdbg_HookEntry_nativeTick(JNIEnv*, jclass) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_moss_mmdbg_HookEntry_nativeStatus(JNIEnv* env, jclass) {
     char buf[512];
-    snprintf(buf, sizeof(buf), "bound=%d frame=%d stage=%d log=%s",
-             g_bound, g_frame, g_probeStage, g_logPath.c_str());
+    snprintf(buf, sizeof(buf), "bound=%d frame=%d stage=%d\nlog=%s%s",
+             g_bound, g_frame, g_probeStage,
+             g_logDir.c_str(), g_logOnSdcard ? " (sdcard)" : " (private)");
     return env->NewStringUTF(buf);
 }
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void*) {
+    pick_log_dir();
     LOGI("===== libmmdbg.so loaded =====");
+    LOGI("[LOG] dir=%s sdcard=%d", g_logDir.c_str(), (int)g_logOnSdcard);
+    pthread_t t;
+    if (pthread_create(&t, nullptr, logcat_thread, nullptr) == 0) pthread_detach(t);
     return JNI_VERSION_1_6;
 }
