@@ -13,6 +13,7 @@
 #include <jni.h>
 #include <dlfcn.h>
 #include <link.h>
+#include <elf.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +100,91 @@ static void flog(const char* fmt, ...) {
 // ============================= il2cpp 绑定 =============================
 static bool g_bound = false;
 
+// dlopen(".../libil2cpp.so") 会失败：
+//   library "libssgamesdkcronet.so" not found ... in namespace clns-13
+// 我们的 so 在 classloader-namespace，解析不到游戏自己的那些内部依赖。
+// 所以不走 dlopen —— 从 maps 拿基址，手工解析 ELF 的 .dynsym 表取符号。
+static uintptr_t maps_base(const char* soname) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return 0;
+    char line[512];
+    uintptr_t addrs[128];
+    int n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, soname)) continue;
+        uintptr_t start = strtoull(line, nullptr, 16);
+        if (n < 128) addrs[n++] = start;
+    }
+    fclose(f);
+    uintptr_t lowest = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t* p = (uint8_t*)addrs[i];
+        if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') return addrs[i];
+        if (!lowest || addrs[i] < lowest) lowest = addrs[i];
+    }
+    return lowest;
+}
+
+static uintptr_t elf_sym(uintptr_t base, const char* name) {
+    if (!base) return 0;
+    ElfW(Ehdr)* eh = (ElfW(Ehdr)*)base;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) return 0;
+
+    uintptr_t dyn = 0;
+    ElfW(Phdr)* ph = (ElfW(Phdr)*)(base + eh->e_phoff);
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) { dyn = base + ph[i].p_vaddr; break; }
+    }
+    if (!dyn) return 0;
+
+    uintptr_t symtab = 0, strtab = 0, hash = 0, gnu = 0;
+    for (ElfW(Dyn)* d = (ElfW(Dyn)*)dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_SYMTAB:   symtab = d->d_un.d_ptr; break;
+            case DT_STRTAB:   strtab = d->d_un.d_ptr; break;
+            case DT_HASH:     hash   = d->d_un.d_ptr; break;
+            case DT_GNU_HASH: gnu    = d->d_un.d_ptr; break;
+            default: break;
+        }
+    }
+    if (symtab < base) symtab += base;
+    if (strtab < base) strtab += base;
+    if (hash && hash < base) hash += base;
+    if (gnu && gnu < base) gnu += base;
+    if (!symtab || !strtab) return 0;
+
+    uint32_t nsym = 0;
+    if (hash) {
+        nsym = ((uint32_t*)hash)[1];
+    } else if (gnu) {
+        uint32_t* g = (uint32_t*)gnu;
+        uint32_t nbuckets = g[0], symoffset = g[1], bloom = g[2];
+        uint32_t* buckets = &g[4 + bloom * 2];
+        uint32_t* chain = &buckets[nbuckets];
+        uint32_t last = 0;
+        for (uint32_t i = 0; i < nbuckets; i++) if (buckets[i] > last) last = buckets[i];
+        if (last >= symoffset) {
+            while (!(chain[last - symoffset] & 1)) last++;
+            nsym = last + 1;
+        }
+    }
+    if (!nsym) return 0;
+    if (nsym > 200000) nsym = 200000;
+
+    ElfW(Sym)* syms = (ElfW(Sym)*)symtab;
+    const char* strs = (const char*)strtab;
+    size_t nameLen = strlen(name);
+    for (uint32_t i = 0; i < nsym; i++) {
+        uint32_t off = syms[i].st_name;
+        if (off == 0 || off > 0xFFFFFF) continue;
+        const char* s = strs + off;
+        size_t k = 0;
+        while (k <= nameLen && s[k] == name[k]) k++;
+        if (k == nameLen + 1) return base + syms[i].st_value;
+    }
+    return 0;
+}
+
 // dlopen("libil2cpp.so") 在游戏进程里找不到 —— Android 的 linker namespace
 // 不会按短名解析从 APK lib 目录加载的 so。得从 /proc/self/maps 把真实路径捞出来。
 static std::string find_lib_path(const char* needle) {
@@ -120,22 +206,13 @@ static std::string find_lib_path(const char* needle) {
 }
 
 static bool bind_api() {
-    std::string path = find_lib_path("libil2cpp.so");
-    void* h = nullptr;
-    int how = 0;
-    if (!path.empty()) {
-        h = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
-        if (!h) { h = dlopen(path.c_str(), RTLD_NOW); how = 2; }
-        LOGI("[IL2CPP] path=%s handle=%p mode=%d", path.c_str(), h, how);
-    } else {
-        h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
-        if (!h) { h = dlopen("libil2cpp.so", RTLD_NOW); how = 1; }
-        LOGI("[IL2CPP] shortname handle=%p mode=%d", h, how);
-    }
-    if (!h) { LOGE("[IL2CPP] dlopen libil2cpp failed: %s", dlerror()); return false; }
+    uintptr_t base = maps_base("libil2cpp.so");
+    if (!base) { LOGE("[IL2CPP] libil2cpp.so not found in /proc/self/maps"); return false; }
+    LOGI("[IL2CPP] base=%p (elf symtab mode)", (void*)base);
 
-    #define B(field, sym) g_api.field = (fn_##field)dlsym(h, sym); \
-        if (!g_api.field) LOGE("[IL2CPP] MISSING %s", sym)
+    int missing = 0;
+    #define B(field, sym) g_api.field = (fn_##field)elf_sym(base, sym); \
+        if (!g_api.field) { missing++; LOGI("[IL2CPP] MISSING %s", sym); }
     B(domain_get,               "il2cpp_domain_get");
     B(domain_get_assemblies,    "il2cpp_domain_get_assemblies");
     B(thread_attach,            "il2cpp_thread_attach");
@@ -168,6 +245,7 @@ static bool bind_api() {
     B(class_array_element_size, "il2cpp_class_array_element_size");
     #undef B
 
+    LOGI("[IL2CPP] symbols resolved, missing=%d", missing);
     if (!g_api.domain_get || !g_api.class_from_name || !g_api.runtime_invoke) {
         LOGE("[IL2CPP] core api missing, bind failed");
         return false;
