@@ -1,10 +1,17 @@
 package com.moss.mmdbg;
 
 import android.app.Activity;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.io.File;
@@ -50,7 +57,8 @@ public class HookEntry implements IXposedHookLoadPackage {
     static Handler tickHandler = null;
     static int tickCount = 0;
     static String lastStatus = "尚未加载";
-    static final WeakHashMap<Activity, FloatPanel> panels = new WeakHashMap<>();
+    static final WeakHashMap<Activity, LinearLayout> overlays = new WeakHashMap<>();
+    static TextView statusView = null;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
@@ -62,64 +70,15 @@ public class HookEntry implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     final Activity a = (Activity) param.thisObject;
-                    if (a == null) return;
-                    try { if (a.getWindow() == null) return; } catch (Throwable ignored) { return; }
-
-                    if (loadSeq == 0 && isMainProcess()) {
-                        lastStatus = doLoadAll();
-                    }
-
-                    final Activity af = a;
-                    new Handler(Looper.getMainLooper()).post(new Runnable() {
-                        @Override public void run() { installPanel(af); }
-                    });
-                }
-
-                void installPanel(final Activity a) {
                     try {
-                        FloatPanel.Theme th = new FloatPanel.Theme();
-                        th.title = "MmdDbg";
-                        th.accent = 0xFFFF8A65;
-                        th.accentDim = 0x66FF8A65;
-                        th.textMain = 0xFFFFD54F;
-                        th.textSub = 0xFF7FD4FF;
-                        th.btnText = 0xFFFFD54F;
-                        final FloatPanel panel = FloatPanel.get(a, th);
-                        panels.put(a, panel);
-                        panel.setLog(lastStatus);
-
-                        if (panels.size() <= 1) {
-                            panel.clearButtons();
-                            TextView reload = panel.addButton("重载 so");
-                            reload.setOnClickListener(new View.OnClickListener() {
-                                @Override public void onClick(View v) {
-                                    lastStatus = doLoadAll();
-                                    panel.setLog(lastStatus);
-                                }
-                            });
-                            TextView where = panel.addButton("路径");
-                            where.setOnClickListener(new View.OnClickListener() {
-                                @Override public void onClick(View v) {
-                                    StringBuilder sb = new StringBuilder();
-                                    File d0 = new File(DIRS[0]);
-                                    File[] fs = d0.listFiles();
-                                    if (fs == null) {
-                                        sb.append("目录不可读: ").append(DIRS[0]);
-                                    } else {
-                                        for (File f : fs) {
-                                            String n = f.getName();
-                                            if (n.startsWith(SO_PREFIX) && n.endsWith(".so"))
-                                                sb.append(n).append("  ").append(f.length()).append('\n');
-                                        }
-                                        if (sb.length() == 0) sb.append("空: ").append(DIRS[0]);
-                                    }
-                                    lastStatus = sb.toString();
-                                    panel.setLog(lastStatus);
-                                }
-                            });
+                        installOverlay(a);
+                        // 第一个 Activity 出现时自动加载一次
+                        if (loadSeq == 0) {
+                            lastStatus = doLoadAll();
+                            refreshStatus();
                         }
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + ": overlay fail " + android.util.Log.getStackTraceString(t));
+                        XposedBridge.log(TAG + ": overlay fail " + t);
                     }
                 }
             });
@@ -129,18 +88,6 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     // ---------------- so 加载 ----------------
-
-    static boolean isMainProcess() {
-        try {
-            java.io.BufferedReader r = new java.io.BufferedReader(
-                    new java.io.FileReader("/proc/self/cmdline"));
-            String s = r.readLine();
-            r.close();
-            return s != null && !s.contains(":");
-        } catch (Throwable t) {
-            return true;
-        }
-    }
 
     // 扫描 <dir>/libmmdbg_<模块名>.so，一个个复制成带序号的新名字再 load。
     // 改名是为了绕开 dlopen 的路径缓存，这样同一个模块也能重载。
@@ -234,7 +181,103 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     // ---------------- 悬浮窗 ----------------
 
+    static void installOverlay(final Activity a) {
+        if (overlays.containsKey(a)) return;
+
+        LinearLayout root = new LinearLayout(a);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(14, 10, 14, 10);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xE6121219);
+        bg.setCornerRadius(16f);
+        bg.setStroke(2, 0x66FF8A65);
+        root.setBackground(bg);
+
+        TextView title = new TextView(a);
+        title.setText("MmdDbg  调试壳");
+        title.setTextColor(0xFFFF8A65);
+        title.setTextSize(12);
+        root.addView(title);
+
+        final TextView status = new TextView(a);
+        status.setTextColor(0xFF7FD4FF);
+        status.setTextSize(10);
+        status.setText(lastStatus);
+        status.setPadding(0, 4, 0, 6);
+        root.addView(status);
+        statusView = status;
+
+        LinearLayout row = new LinearLayout(a);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView reload = mkBtn(a, "重载 so");
+        reload.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                lastStatus = doLoadAll();
+                refreshStatus();
+            }
+        });
+        row.addView(reload, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView where = mkBtn(a, "路径");
+        where.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                StringBuilder sb = new StringBuilder();
+                File d0 = new File(DIRS[0]);
+                File[] fs = d0.listFiles();
+                if (fs == null) {
+                    sb.append("目录不可读: ").append(DIRS[0]);
+                } else {
+                    for (File f : fs) {
+                        String n = f.getName();
+                        if (n.startsWith(SO_PREFIX) && n.endsWith(".so"))
+                            sb.append(n).append("  ").append(f.length()).append('\n');
+                    }
+                    if (sb.length() == 0) sb.append("空: ").append(DIRS[0]);
+                }
+                lastStatus = sb.toString();
+                refreshStatus();
+            }
+        });
+        row.addView(where, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        root.addView(row);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = 36;
+        lp.topMargin = 300;
+
+        // 挂到 DecorView，避免被 content view 裁剪
+        ViewGroup decor = null;
+        try { decor = (ViewGroup) a.getWindow().getDecorView(); } catch (Throwable ignored) { }
+        if (decor != null) decor.addView(root, lp);
+        else a.addContentView(root, lp);
+
+        overlays.put(a, root);
+    }
+
     static void refreshStatus() {
-        for (FloatPanel p : panels.values()) p.setLog(lastStatus);
+        if (statusView == null) return;
+        statusView.post(new Runnable() {
+            @Override public void run() {
+                try { statusView.setText(lastStatus); } catch (Throwable ignored) { }
+            }
+        });
+    }
+
+    static TextView mkBtn(Activity a, String text) {
+        TextView tv = new TextView(a);
+        tv.setText(text);
+        tv.setTextColor(0xFFFFD54F);
+        tv.setTextSize(12);
+        tv.setGravity(Gravity.CENTER);
+        tv.setPadding(18, 14, 18, 14);
+        GradientDrawable b = new GradientDrawable();
+        b.setColor(0x33FF8A65);
+        b.setCornerRadius(12f);
+        b.setStroke(1, 0xAAFF8A65);
+        tv.setBackground(b);
+        return tv;
     }
 }
